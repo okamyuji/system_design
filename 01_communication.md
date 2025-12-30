@@ -1,0 +1,260 @@
+# コミュニケーション設計
+
+## リクエストを送信(HTTP)
+
+### 概要
+
+HTTPは、クライアントとサーバー間でデータをやり取りする際の標準的なプロトコルです。
+RESTful APIを実装する場合、HTTP methodsを適切に使い分け、ステートレスな設計を実現します。
+
+### システム設計図
+
+```mermaid
+sequenceDiagram
+    participant Client as クライアント
+    participant LB as ロードバランサー
+    participant API as APIサーバー
+    participant Cache as キャッシュ(Redis)
+    participant DB as データベース
+
+    Client->>LB: HTTPリクエスト(GET/POST/PUT/DELETE)
+    LB->>API: リクエスト転送
+    API->>Cache: キャッシュ確認
+    alt キャッシュヒット
+        Cache-->>API: キャッシュデータ
+    else キャッシュミス
+        API->>DB: クエリ実行
+        DB-->>API: データ取得
+        API->>Cache: キャッシュ保存
+    end
+    API-->>LB: HTTPレスポンス(JSON)
+    LB-->>Client: レスポンス返却
+```
+
+### 設計のポイント
+
+ロードバランサーを配置することで、複数のAPIサーバーに負荷を分散します。
+キャッシュレイヤーを導入することで、データベースへの負荷を軽減し、レスポンス速度を向上させます。
+HTTPステータスコードを適切に使用し、エラーハンドリングを明確にします。
+冪等性を保証することで、ネットワーク障害時のリトライを安全に実行できます。
+
+## サーバー側の更新をリアルタイムに受け取る(Polling / Long Polling / SSE)
+
+### 概要
+
+サーバー側の状態変更をクライアントに通知する方法として、Polling、Long Polling、Server-Sent Events(SSE)があります。
+それぞれの特性を理解し、ユースケースに応じて選択します。
+
+### システム設計図
+
+```mermaid
+sequenceDiagram
+    participant Client as クライアント
+    participant LB as ロードバランサー
+    participant API as APIサーバー
+    participant MQ as メッセージキュー
+    participant DB as データベース
+
+    Note over Client,DB: Short Polling方式
+    loop 定期的なポーリング(例: 5秒ごと)
+        Client->>API: データ取得リクエスト
+        API->>DB: 最新データ確認
+        DB-->>API: データ返却
+        API-->>Client: レスポンス(データまたは304)
+    end
+
+    Note over Client,DB: Long Polling方式
+    Client->>API: データ取得リクエスト
+    API->>MQ: メッセージ待機(タイムアウト60秒)
+    alt 新しいイベント発生
+        MQ-->>API: イベント通知
+        API-->>Client: イベントデータ返却
+        Client->>API: 再接続リクエスト
+    else タイムアウト
+        API-->>Client: 空レスポンス
+        Client->>API: 再接続リクエスト
+    end
+
+    Note over Client,DB: Server-Sent Events方式
+    Client->>API: SSE接続確立
+    API->>Client: 接続確立(text/event-stream)
+    loop イベント発生時
+        MQ->>API: イベント通知
+        API->>Client: data: イベントデータ送信
+    end
+```
+
+### 設計のポイント
+
+Short Pollingは、実装がシンプルですが、無駄なリクエストが多く発生します。
+Long Pollingは、リアルタイム性が向上しますが、コネクション管理が必要です。
+SSEは、サーバーからクライアントへの一方向通信に適しており、自動再接続機能を持ちます。
+タイムアウト値は、ネットワーク環境やユースケースに応じて調整します。
+
+## リアルタイム双方向通信(WebSocket)
+
+### 概要
+
+WebSocketは、クライアントとサーバー間で双方向のリアルタイム通信を実現するプロトコルです。
+チャットアプリケーションやリアルタイムコラボレーションツールなどで使用されます。
+
+### システム設計図
+
+```mermaid
+sequenceDiagram
+    participant Client1 as クライアント1
+    participant Client2 as クライアント2
+    participant LB as ロードバランサー
+    participant WS1 as WebSocketサーバー1
+    participant WS2 as WebSocketサーバー2
+    participant Redis as Redis Pub/Sub
+    participant DB as データベース
+
+    Client1->>LB: WebSocketハンドシェイク
+    LB->>WS1: 接続転送(Sticky Session)
+    WS1-->>Client1: 接続確立
+
+    Client2->>LB: WebSocketハンドシェイク
+    LB->>WS2: 接続転送(Sticky Session)
+    WS2-->>Client2: 接続確立
+
+    Client1->>WS1: メッセージ送信
+    WS1->>DB: メッセージ保存
+    WS1->>Redis: Publish(channel: room_id)
+    Redis->>WS1: Subscribe通知
+    Redis->>WS2: Subscribe通知
+    WS1->>Client1: メッセージ配信
+    WS2->>Client2: メッセージ配信
+```
+
+### 設計のポイント
+
+Sticky Sessionを使用して、同じクライアントを同じサーバーに接続し続けます。
+Redis Pub/Subを使用して、複数のWebSocketサーバー間でメッセージを同期します。
+コネクション数の上限を考慮し、サーバーのスケーリングを計画します。
+ハートビートを定期的に送信して、接続の生存確認を行います。
+再接続時のメッセージ取得ロジックを実装し、メッセージの欠落を防ぎます。
+
+## サービス間通信の設計
+
+### 概要
+
+マイクロサービスアーキテクチャにおいて、サービス間の通信方法を適切に設計します。
+同期通信(REST、gRPC)と非同期通信(メッセージキュー)を使い分けます。
+
+### システム設計図
+
+```mermaid
+graph TB
+    subgraph "同期通信"
+        Client[クライアント]
+        Gateway[API Gateway]
+        UserService[ユーザーサービス]
+        OrderService[注文サービス]
+        PaymentService[決済サービス]
+        
+        Client -->|REST| Gateway
+        Gateway -->|gRPC| UserService
+        Gateway -->|gRPC| OrderService
+        OrderService -->|gRPC| PaymentService
+    end
+    
+    subgraph "非同期通信"
+        OrderServiceAsync[注文サービス]
+        Queue[メッセージキュー]
+        InventoryService[在庫サービス]
+        NotificationService[通知サービス]
+        
+        OrderServiceAsync -->|Publish| Queue
+        Queue -->|Subscribe| InventoryService
+        Queue -->|Subscribe| NotificationService
+    end
+    
+    subgraph "サービスディスカバリ"
+        ServiceRegistry[サービスレジストリ]
+        UserService -.->|登録| ServiceRegistry
+        OrderService -.->|登録| ServiceRegistry
+        PaymentService -.->|登録| ServiceRegistry
+        Gateway -.->|検索| ServiceRegistry
+    end
+```
+
+### 設計のポイント
+
+同期通信は、即座にレスポンスが必要な場合に使用します。
+非同期通信は、処理の完了を待つ必要がない場合や、複数サービスへの通知が必要な場合に使用します。
+サービスディスカバリを導入して、動的なサービス検出とロードバランシングを実現します。
+Circuit Breakerパターンを実装して、障害の連鎖を防ぎます。
+タイムアウト値とリトライポリシーを適切に設定します。
+
+## Pub/Subで複数のサービスにメッセージ配信
+
+### 概要
+
+Publish/Subscribeパターンを使用して、1つのイベントを複数のサービスに非同期で配信します。
+サービス間の疎結合を実現し、システムの拡張性を向上させます。
+
+### システム設計図
+
+```mermaid
+graph LR
+    subgraph "Publisher"
+        OrderService[注文サービス]
+    end
+    
+    subgraph "Message Broker"
+        Topic1[注文完了トピック]
+        Topic2[在庫更新トピック]
+    end
+    
+    subgraph "Subscribers"
+        InventoryService[在庫サービス]
+        NotificationService[通知サービス]
+        AnalyticsService[分析サービス]
+        BillingService[請求サービス]
+    end
+    
+    OrderService -->|Publish: OrderCompleted| Topic1
+    OrderService -->|Publish: InventoryChanged| Topic2
+    
+    Topic1 -->|Subscribe| InventoryService
+    Topic1 -->|Subscribe| NotificationService
+    Topic1 -->|Subscribe| AnalyticsService
+    Topic1 -->|Subscribe| BillingService
+    
+    Topic2 -->|Subscribe| AnalyticsService
+```
+
+```mermaid
+sequenceDiagram
+    participant Order as 注文サービス
+    participant Broker as メッセージブローカー
+    participant Inventory as 在庫サービス
+    participant Notification as 通知サービス
+    participant Analytics as 分析サービス
+
+    Order->>Broker: Publish(OrderCompleted Event)
+    Note over Broker: イベントをトピックに保存
+    
+    par 並列配信
+        Broker->>Inventory: OrderCompleted Event
+        Inventory->>Inventory: 在庫更新処理
+        Inventory-->>Broker: ACK
+    and
+        Broker->>Notification: OrderCompleted Event
+        Notification->>Notification: メール送信処理
+        Notification-->>Broker: ACK
+    and
+        Broker->>Analytics: OrderCompleted Event
+        Analytics->>Analytics: 分析データ保存
+        Analytics-->>Broker: ACK
+    end
+```
+
+### 設計のポイント
+
+メッセージブローカー(Kafka、RabbitMQ、AWS SNS/SQSなど)を使用して、信頼性の高いメッセージ配信を実現します。
+各サブスクライバーは独立して動作し、他のサブスクライバーの障害に影響されません。
+メッセージの順序保証が必要な場合は、パーティションキーを使用します。
+メッセージの重複配信に対応するため、冪等性を考慮した処理を実装します。
+Dead Letter Queueを設定して、処理に失敗したメッセージを別途管理します。
